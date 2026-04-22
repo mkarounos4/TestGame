@@ -32,6 +32,10 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// width/height
+static int gWidth;
+static int gHeight;
+
 // ---------------------------------------------------------------------------
 // EGL state
 //
@@ -51,9 +55,15 @@ static EGLContext sContext = EGL_NO_CONTEXT;
 static GLuint sProgram = 0;  // Linked shader program
 static GLuint sVbo     = 0;  // Vertex Buffer Object — stores triangle vertices
 static GLuint sVao     = 0;  // Vertex Array Object  — records attribute layout
+static GLuint sFbo = 0;
+static GLuint sColorTexture = 0;
+static GLuint sQuadVao = 0;
+static GLuint sQuadVbo = 0;
+static GLuint sBlurProgram = 0;
 
 // Location of the "uAngle" uniform inside the vertex shader.
 static GLint sUAngleLoc = -1;
+static GLint sUScaleLoc = -1;
 
 // ---------------------------------------------------------------------------
 // Rotation state
@@ -71,6 +81,36 @@ static constexpr float kRotationLerpSpeed = 0.1f;
 
 // Amount added to targetAngle per tap, in radians (90°).
 static constexpr float kTapRotationStep = static_cast<float>(M_PI) / 2.0f;
+
+// ---------------------------------------------------------------------------
+// Magnification state
+//
+// sMagnified      : toggled by double-tap; true = zoomed in.
+// sTargetScale    : 2.0 when magnified, 1.0 when normal.
+// sCurrentScale   : smoothly lerps toward sTargetScale each frame.
+// kScaleLerpSpeed : how fast the zoom animates (matches rotation feel).
+// kMagnifiedScale : the zoom factor applied when magnified.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> sMagnified{false};
+static float sTargetScale  = 1.0f;
+static float sCurrentScale = 1.0f;
+
+static constexpr float kScaleLerpSpeed = 0.1f;
+static constexpr float kMagnifiedScale = 2.0f;
+
+// ---------------------------------------------------------------------------
+// Pending viewport resize — written by setViewport (any thread),
+// consumed by render() (GL thread). Using atomics for thread safety.
+// ---------------------------------------------------------------------------
+static std::atomic<int> sPendingWidth{0};
+static std::atomic<int> sPendingHeight{0};
+static std::atomic<bool> sPendingResize{false};
+
+// ---------------------------------------------------------------------------
+// Forward declaration
+// ---------------------------------------------------------------------------
+static void initPostProcessing(int width, int height);
+static void resizePostProcessing(int width, int height);
 
 // ---------------------------------------------------------------------------
 // Triangle geometry  (clip space, counter-clockwise winding)
@@ -101,6 +141,7 @@ static const char* kVertexShaderSrc = R"GLSL(#version 300 es
 layout(location = 0) in vec3 aPos;
 
 uniform float uAngle;
+uniform float uScale;
 
 void main() {
     float c = cos(uAngle);
@@ -112,7 +153,7 @@ void main() {
         aPos.x * s + aPos.y * c
     );
 
-    gl_Position = vec4(rotated, 0.0, 1.0);
+    gl_Position = vec4(rotated * uScale, 0.0, 1.0);
 }
 )GLSL";
 
@@ -124,6 +165,56 @@ out vec4 FragColor;
 
 void main() {
     FragColor = vec4(1.0, 0.0, 0.0, 1.0);
+}
+)GLSL";
+
+static const char* kBlurVertexShaderSrc = R"GLSL(#version 300 es
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aTex;
+
+out vec2 TexCoords;
+
+void main() {
+    TexCoords = aTex;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)GLSL";
+
+static const char* kBlurFragmentShaderSrc = R"GLSL(#version 300 es
+precision mediump float;
+
+in vec2 TexCoords;
+out vec4 FragColor;
+
+uniform sampler2D screenTexture;
+uniform vec2 uTexelSize;
+
+void main() {
+    vec2 offsets[9] = vec2[](
+        vec2(-uTexelSize.x,  uTexelSize.y),  // top-left
+        vec2( 0.0,           uTexelSize.y),  // top-center
+        vec2( uTexelSize.x,  uTexelSize.y),  // top-right
+        vec2(-uTexelSize.x,  0.0),           // center-left
+        vec2( 0.0,           0.0),           // center
+        vec2( uTexelSize.x,  0.0),           // center-right
+        vec2(-uTexelSize.x, -uTexelSize.y),  // bottom-left
+        vec2( 0.0,          -uTexelSize.y),  // bottom-center
+        vec2( uTexelSize.x, -uTexelSize.y)   // bottom-right
+    );
+
+    float kernel[9] = float[](
+        1.0/16.0, 2.0/16.0, 1.0/16.0,
+        2.0/16.0, 4.0/16.0, 2.0/16.0,
+        1.0/16.0, 2.0/16.0, 1.0/16.0
+    );
+
+    vec3 col = vec3(0.0);
+
+    for (int i = 0; i < 9; i++) {
+        col += texture(screenTexture, TexCoords + offsets[i]).rgb * kernel[i];
+    }
+
+    FragColor = vec4(col, 1.0);
 }
 )GLSL";
 
@@ -260,7 +351,105 @@ static void initGeometry() {
 static void initShaders() {
     sProgram   = buildProgram(kVertexShaderSrc, kFragmentShaderSrc);
     sUAngleLoc = glGetUniformLocation(sProgram, "uAngle");
+    sUScaleLoc = glGetUniformLocation(sProgram, "uScale");
     LOGI("Shaders compiled. uAngle location: %d", sUAngleLoc);
+}
+
+static void initPostProcessing(int width, int height) {
+    // -----------------------------
+    // 1. Create framebuffer
+    // -----------------------------
+    glGenFramebuffers(1, &sFbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
+
+    // -----------------------------
+    // 2. Create color texture
+    // -----------------------------
+    glGenTextures(1, &sColorTexture);
+    glBindTexture(GL_TEXTURE_2D, sColorTexture);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+
+    // Filtering
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    // prevent edge artifacts
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    // Attach texture to framebuffer
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, sColorTexture, 0);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        LOGE("Framebuffer not complete!");
+    }
+
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        LOGE("FBO incomplete! status=0x%x", status);
+    } else {
+        LOGI("FBO complete at %dx%d", width, height);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // -----------------------------
+    // 3. Fullscreen quad
+    // -----------------------------
+    float quadVertices[] = {
+            -1.0f,  1.0f,  0.0f, 1.0f,
+            -1.0f, -1.0f,  0.0f, 0.0f,
+            1.0f, -1.0f,  1.0f, 0.0f,
+            -1.0f,  1.0f,  0.0f, 1.0f,
+            1.0f, -1.0f,  1.0f, 0.0f,
+            1.0f,  1.0f,  1.0f, 1.0f
+    };
+
+    glGenVertexArrays(1, &sQuadVao);
+    glGenBuffers(1, &sQuadVbo);
+
+    glBindVertexArray(sQuadVao);
+    glBindBuffer(GL_ARRAY_BUFFER, sQuadVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+
+    // position (location = 0)
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)nullptr);
+    glEnableVertexAttribArray(0);
+
+    // (location = 1)
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float),
+                          (void*)(2*sizeof(float)));
+    glEnableVertexAttribArray(1);
+
+    glBindVertexArray(0);
+
+    // -----------------------------
+    // 4. Blur shader
+    // -----------------------------
+    sBlurProgram = buildProgram(kBlurVertexShaderSrc, kBlurFragmentShaderSrc);
+
+    glUseProgram(sBlurProgram);
+
+    glUniform1i(glGetUniformLocation(sBlurProgram, "screenTexture"), 0);
+    glUniform2f(glGetUniformLocation(sBlurProgram, "uTexelSize"),
+                1.0f / (float)width, 1.0f / (float)height);
+
+    LOGI("Post-processing initialised at %dx%d.", width, height);
+}
+
+// Called on subsequent resizes only.
+static void resizePostProcessing(int width, int height) {
+    glBindTexture(GL_TEXTURE_2D, sColorTexture);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0,
+                 GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+
+    glUseProgram(sBlurProgram);
+    glUniform2f(glGetUniformLocation(sBlurProgram, "uTexelSize"),
+                1.0f / (float)width, 1.0f / (float)height);
+
+    LOGI("Post-processing resized to %dx%d.", width, height);
 }
 
 /**
@@ -274,6 +463,7 @@ static void initGLInternal(ANativeWindow* window) {
     initEGL(window);       // 1. Connect to the display, create GL context
     initGeometry();        // 2. Upload mesh data to the GPU
     initShaders();         // 3. Compile shaders, cache uniform locations
+
     LOGI("GL initialisation complete. Renderer: %s", glGetString(GL_RENDERER));
 }
 
@@ -300,20 +490,63 @@ Java_com_test_testgame_MainActivity_initGL(JNIEnv* env, jobject /*thiz*/, jobjec
  * Called every frame from the render loop (typically a Choreographer callback).
  */
 extern "C" JNIEXPORT void JNICALL
-Java_com_test_testgame_MainActivity_render(JNIEnv* /*env*/, jobject /*thiz*/) {
-    // Smooth the current angle toward the tap-driven target.
+Java_com_test_testgame_MainActivity_render(JNIEnv*, jobject) {
+    // handle render resize/initialization
+    if (sPendingResize.load(std::memory_order_acquire)) {
+        sPendingResize.store(false, std::memory_order_relaxed);
+
+        int w = sPendingWidth.load(std::memory_order_relaxed);
+        int h = sPendingHeight.load(std::memory_order_relaxed);
+
+        if (w > 0 && h > 0) {
+            gWidth  = w;
+            gHeight = h;
+            glViewport(0, 0, w, h);
+
+            if (sFbo == 0) {
+                // create all post-processing resources.
+                initPostProcessing(w, h);
+            } else {
+                // update texture and uniforms only.
+                resizePostProcessing(w, h);
+            }
+        }
+    }
+
+    // don't draw until post-processing is ready.
+    if (sFbo == 0 || gWidth == 0 || gHeight == 0) return;
+
+    // Prepare rotation
     float target = sTargetAngle.load(std::memory_order_relaxed);
     sCurrentAngle += (target - sCurrentAngle) * kRotationLerpSpeed;
 
+    // interpolate to scale
+    sTargetScale   = sMagnified.load(std::memory_order_relaxed) ? kMagnifiedScale : 1.0f;
+    sCurrentScale += (sTargetScale - sCurrentScale) * kScaleLerpSpeed;
+
+    // ── Pass 1: render triangle
+    glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
+    glViewport(0, 0, gWidth, gHeight);
     glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(sProgram);
     glUniform1f(sUAngleLoc, sCurrentAngle);
+    glUniform1f(sUScaleLoc, sCurrentScale);
 
     glBindVertexArray(sVao);
     glDrawArrays(GL_TRIANGLES, 0, kVertexCount);
-    glBindVertexArray(0);
+
+    // ── Pass 2: apply blur
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, gWidth, gHeight);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(sBlurProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sColorTexture);
+    glBindVertexArray(sQuadVao);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
 
     eglSwapBuffers(sDisplay, sSurface);
 }
@@ -325,7 +558,11 @@ Java_com_test_testgame_MainActivity_render(JNIEnv* /*env*/, jobject /*thiz*/) {
  */
 extern "C" JNIEXPORT void JNICALL
 Java_com_test_testgame_MainActivity_setViewport(JNIEnv* /*env*/, jobject /*thiz*/, jint w, jint h) {
-    glViewport(0, 0, w, h);
+    // Store new Viewport Dimensions
+    sPendingWidth.store(w,  std::memory_order_relaxed);
+    sPendingHeight.store(h, std::memory_order_relaxed);
+    sPendingResize.store(true, std::memory_order_release);
+    LOGI("setViewport: queued resize to %d x %d", w, h);
 }
 
 /**
@@ -334,8 +571,15 @@ Java_com_test_testgame_MainActivity_setViewport(JNIEnv* /*env*/, jobject /*thiz*
  * Safe to call from the UI thread; uses atomic store.
  */
 extern "C" JNIEXPORT void JNICALL
-Java_com_test_testgame_MainActivity_onTap(JNIEnv* /*env*/, jobject /*thiz*/) {
+Java_com_test_testgame_MainActivity_onSingleTap(JNIEnv* /*env*/, jobject /*thiz*/) {
     float next = sTargetAngle.load(std::memory_order_relaxed) + kTapRotationStep;
     sTargetAngle.store(next, std::memory_order_relaxed);
     LOGI("Tap! Target angle now: %.4f rad (%.1f deg)", next, next * (180.0f / M_PI));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_test_testgame_MainActivity_onDoubleTap(JNIEnv* /*env*/, jobject /*thiz*/) {
+    bool next = !sMagnified.load(std::memory_order_relaxed);
+    sMagnified.store(next, std::memory_order_relaxed);
+    LOGI("Double tap! Magnification %s", next ? "ON" : "OFF");
 }
