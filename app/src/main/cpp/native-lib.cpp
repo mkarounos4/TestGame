@@ -522,6 +522,19 @@ static void uploadPendingImage(JNIEnv *env) {
     if (AndroidBitmap_getInfo(env, sPendingBitmap, &info) < 0)  return;
     if (AndroidBitmap_lockPixels(env, sPendingBitmap, &pixels) < 0) return;
 
+    // ---------------------------------------------------------------------------
+    // Pixel manipulation: if RGB is close to red, make it purple.
+    if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        unsigned char* data = (unsigned char*)pixels;
+        for (unsigned int i = 0; i < info.width * info.height * 4; i += 4) {
+            // RGBA_8888: [i]=R, [i+1]=G, [i+2]=B, [i+3]=A
+            if (data[i] > 200 && data[i + 1] < 100 && data[i + 2] < 100) {
+                data[i + 2] = 255; // Boost Blue to turn Red into Purple
+            }
+        }
+    }
+    // ---------------------------------------------------------------------------
+
     glBindTexture(GL_TEXTURE_2D, sImageTexture);
     GLint format = (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) ? GL_RGBA : GL_RGB;
     glTexImage2D(GL_TEXTURE_2D, 0, format, info.width, info.height, 0, format, GL_UNSIGNED_BYTE, pixels);
