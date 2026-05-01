@@ -1,12 +1,16 @@
 package com.test.testgame
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
+import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import android.os.Handler
-import android.os.Looper
 
 class MainActivity : AppCompatActivity() {
 
@@ -14,11 +18,12 @@ class MainActivity : AppCompatActivity() {
     private var renderThread: Thread? = null
     @Volatile private var glReady = false
 
-    // single/double tap handling
-    private val handler = Handler(Looper.getMainLooper())
-    private val DOUBLE_TAP_TIME = 250L
-    private var lastTapTime = 0L
-    private var singleTapRunnable: Runnable? = null
+    // Image picker
+    private val pickMedia = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) {
+            loadBitmapFromUri(uri)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -26,11 +31,32 @@ class MainActivity : AppCompatActivity() {
         surfaceView = SurfaceView(this)
         setContentView(surfaceView)
 
-        surfaceView.setOnTouchListener { _, event ->
-            if (event.action == MotionEvent.ACTION_DOWN) {
-                handleTap()
+        // GestureDetector handles the complexity of distinguishing between single tap, double tap, and long press.
+        val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+
+            // Triggered only after it's confirmed not to be a double tap or long press
+            override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
+                onSingleTap()
+                return true
             }
-            true
+
+            override fun onDoubleTap(e: MotionEvent): Boolean {
+                onDoubleTap()
+                return true
+            }
+
+            override fun onLongPress(e: MotionEvent) {
+                pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            }
+        })
+
+        surfaceView.setOnTouchListener { v, event ->
+            val handled = gestureDetector.onTouchEvent(event)
+            if (event.action == MotionEvent.ACTION_UP) {
+                v.performClick()
+            }
+            handled || true
         }
 
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
@@ -64,29 +90,13 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
-    // Distinguishes between single and double taps
-    private fun handleTap() {
-        val currentTime = System.currentTimeMillis()
-
-        if (currentTime - lastTapTime < DOUBLE_TAP_TIME) {
-            // Double tap detected → cancel single tap
-            if (singleTapRunnable != null) {
-                handler.removeCallbacks(singleTapRunnable!!)
+    private fun loadBitmapFromUri(uri: Uri) {
+        contentResolver.openInputStream(uri)?.use { inputStream ->
+            val bitmap = BitmapFactory.decodeStream(inputStream)
+            if (bitmap != null) {
+                setImage(bitmap)
             }
-            singleTapRunnable = null
-
-            onDoubleTap()
-            lastTapTime = 0L
-        } else {
-            lastTapTime = currentTime
-
-            singleTapRunnable = Runnable {
-                onSingleTap()
-            }
-
-            handler.postDelayed(singleTapRunnable!!, DOUBLE_TAP_TIME)
         }
-
     }
 
     external fun initGL(surface: android.view.Surface)
@@ -94,6 +104,7 @@ class MainActivity : AppCompatActivity() {
     external fun setViewport(width: Int, height: Int)
     external fun onSingleTap()
     external fun onDoubleTap()
+    external fun setImage(bitmap: Bitmap)
 
     companion object {
         init {

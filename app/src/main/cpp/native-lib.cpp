@@ -19,6 +19,7 @@
 #include <jni.h>
 #include <android/native_window_jni.h>
 #include <android/log.h>
+#include <android/bitmap.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <cmath>
@@ -53,20 +54,22 @@ static EGLContext sContext = EGL_NO_CONTEXT;
 // ---------------------------------------------------------------------------
 
 static GLuint sProgram = 0;  // Linked shader program
-static GLuint sVbo     = 0;  // Vertex Buffer Object — stores triangle vertices
-static GLuint sVao     = 0;  // Vertex Array Object  — records attribute layout
+static GLuint sVbo     = 0;  // Vertex Buffer Object
+static GLuint sVao     = 0;  // Vertex Array Object
 static GLuint sFbo = 0;
 static GLuint sColorTexture = 0;
 static GLuint sQuadVao = 0;
 static GLuint sQuadVbo = 0;
 static GLuint sBlurProgram = 0;
+static GLuint sImageTexture = 0;
 
 // Location of the "uAngle" uniform inside the vertex shader.
 static GLint sUAngleLoc = -1;
 static GLint sUScaleLoc = -1;
+static GLint sUTexLoc = -1;
 
 // ---------------------------------------------------------------------------
-// Rotation state
+// Rotation / Scale state
 //
 // targetAngle  : where we want to end up (written by the UI thread via onTap).
 // currentAngle : the angle actually passed to the shader each frame, smoothed
@@ -107,21 +110,41 @@ static std::atomic<int> sPendingHeight{0};
 static std::atomic<bool> sPendingResize{false};
 
 // ---------------------------------------------------------------------------
-// Forward declaration
+// Image update state
+// ---------------------------------------------------------------------------
+static std::atomic<bool> sNewImagePending{false};
+static jobject sPendingBitmap = nullptr;
+
+// ---------------------------------------------------------------------------
+// Forward declarations
 // ---------------------------------------------------------------------------
 static void initPostProcessing(int width, int height);
 static void resizePostProcessing(int width, int height);
 
 // ---------------------------------------------------------------------------
-// Triangle geometry  (clip space, counter-clockwise winding)
+// Geometry  (clip space, counter-clockwise winding)
 // ---------------------------------------------------------------------------
 
-static const GLfloat kVertices[] = {
+// Triagle Geometry
+/*static const GLfloat kVertices[] = {
         0.0f,  0.5f, 0.0f,   // top
-        -0.5f, -0.5f, 0.0f,   // bottom-left
         0.5f, -0.5f, 0.0f,   // bottom-right
+        -0.5f, -0.5f, 0.0f,   // bottom-left
 };
-static constexpr GLsizei kVertexCount = 3;
+static constexpr GLsizei kVertexCount = 3;*/
+
+// Image Geometry
+static const GLfloat kVertices[] = {
+        // X,     Y,     Z,     U,     V
+        -0.5f, 0.5f, 0.0f, 0.0f, 0.0f, // Top-Left
+        -0.5f, -0.5f, 0.0f, 0.0f, 1.0f, // Bottom-Left
+        0.5f, -0.5f, 0.0f, 1.0f, 1.0f, // Bottom-Right
+
+        -0.5f, 0.5f, 0.0f, 0.0f, 0.0f, // Top-Left
+        0.5f, -0.5f, 0.0f, 1.0f, 1.0f, // Top-Left
+        0.5f, 0.5f, 0.0f, 1.0f, 0.0f, // Top-Left
+};
+static constexpr GLsizei kVertexCount = 6;
 
 // ---------------------------------------------------------------------------
 // GLSL shaders
@@ -139,9 +162,11 @@ static constexpr GLsizei kVertexCount = 3;
 static const char* kVertexShaderSrc = R"GLSL(#version 300 es
 
 layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec2 aTexCoord;
 
 uniform float uAngle;
 uniform float uScale;
+out vec2 vTexCoord;
 
 void main() {
     float c = cos(uAngle);
@@ -154,6 +179,7 @@ void main() {
     );
 
     gl_Position = vec4(rotated * uScale, 0.0, 1.0);
+    vTexCoord = aTexCoord;
 }
 )GLSL";
 
@@ -161,10 +187,12 @@ void main() {
 static const char* kFragmentShaderSrc = R"GLSL(#version 300 es
 
 precision mediump float;
+uniform sampler2D uTexture;
+in vec2 vTexCoord;
 out vec4 FragColor;
 
 void main() {
-    FragColor = vec4(1.0, 0.0, 0.0, 1.0);
+    FragColor = texture(uTexture, vTexCoord); // Triangle: vec4(1.0, 0.0, 0.0, 1.0);
 }
 )GLSL";
 
@@ -327,16 +355,27 @@ static void initGeometry() {
     glBufferData(GL_ARRAY_BUFFER, sizeof(kVertices), kVertices, GL_STATIC_DRAW);
 
     // Attribute 0: vec3 position, tightly packed, no offset.
+    // Pos: location 0
     glVertexAttribPointer(
             /*index=*/      0,
             /*size=*/       3,
             /*type=*/       GL_FLOAT,
             /*normalized=*/ GL_FALSE,
-            /*stride=*/     3 * sizeof(GLfloat),
+            /*stride=*/     5 * sizeof(GLfloat), // 3 for Triangle
             /*offset=*/     nullptr
     );
     glEnableVertexAttribArray(0);
 
+    // UV: location 1
+    glVertexAttribPointer(
+            /*index=*/      1,
+            /*size=*/       2,
+            /*type=*/       GL_FLOAT,
+            /*normalized=*/ GL_FALSE,
+            /*stride=*/     5 * sizeof(GLfloat), // 3 for Triangle
+            /*offset=*/     (void *)(3 * sizeof(GLfloat))
+    );
+    glEnableVertexAttribArray(1);
     glBindVertexArray(0);  // Unbind so later code cannot accidentally mutate the VAO.
     LOGI("Geometry uploaded (%d vertices).", kVertexCount);
 }
@@ -352,6 +391,15 @@ static void initShaders() {
     sProgram   = buildProgram(kVertexShaderSrc, kFragmentShaderSrc);
     sUAngleLoc = glGetUniformLocation(sProgram, "uAngle");
     sUScaleLoc = glGetUniformLocation(sProgram, "uScale");
+    sUTexLoc   = glGetUniformLocation(sProgram, "uTexture");
+
+    glGenTextures(1, &sImageTexture);
+    glBindTexture(GL_TEXTURE_2D, sImageTexture);
+    unsigned char pixels[] = {255, 0, 0 , 255}; // Red
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
     LOGI("Shaders compiled. uAngle location: %d", sUAngleLoc);
 }
 
@@ -368,8 +416,7 @@ static void initPostProcessing(int width, int height) {
     glGenTextures(1, &sColorTexture);
     glBindTexture(GL_TEXTURE_2D, sColorTexture);
 
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0,
-                 GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
 
     // Filtering
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -459,12 +506,35 @@ static void resizePostProcessing(int width, int height) {
  *
  * Must be called from the GL/render thread.
  */
-static void initGLInternal(ANativeWindow* window) {
+/*static void initGLInternal(ANativeWindow* window) {
     initEGL(window);       // 1. Connect to the display, create GL context
     initGeometry();        // 2. Upload mesh data to the GPU
     initShaders();         // 3. Compile shaders, cache uniform locations
 
     LOGI("GL initialisation complete. Renderer: %s", glGetString(GL_RENDERER));
+}*/
+
+static void uploadPendingImage(JNIEnv *env) {
+    if (!sNewImagePending.load(std::memory_order_acquire)) return;
+
+    AndroidBitmapInfo info;
+    void *pixels = nullptr;
+    if (AndroidBitmap_getInfo(env, sPendingBitmap, &info) < 0)  return;
+    if (AndroidBitmap_lockPixels(env, sPendingBitmap, &pixels) < 0) return;
+
+    glBindTexture(GL_TEXTURE_2D, sImageTexture);
+    GLint format = (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) ? GL_RGBA : GL_RGB;
+    glTexImage2D(GL_TEXTURE_2D, 0, format, info.width, info.height, 0, format, GL_UNSIGNED_BYTE, pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    AndroidBitmap_unlockPixels(env, sPendingBitmap);
+    env->DeleteGlobalRef(sPendingBitmap);
+    sPendingBitmap = nullptr;
+    sNewImagePending.store(false, std::memory_order_release);
+    LOGI("Image uploaded.");
 }
 
 // ---------------------------------------------------------------------------
@@ -480,7 +550,9 @@ static void initGLInternal(ANativeWindow* window) {
 extern "C" JNIEXPORT void JNICALL
 Java_com_test_testgame_MainActivity_initGL(JNIEnv* env, jobject /*thiz*/, jobject surfaceObj) {
     ANativeWindow* window = ANativeWindow_fromSurface(env, surfaceObj);
-    initGLInternal(window);
+    initEGL(window);
+    initGeometry();
+    initShaders();
     ANativeWindow_release(window);  // EGL holds its own reference; we can release ours.
 }
 
@@ -490,7 +562,7 @@ Java_com_test_testgame_MainActivity_initGL(JNIEnv* env, jobject /*thiz*/, jobjec
  * Called every frame from the render loop (typically a Choreographer callback).
  */
 extern "C" JNIEXPORT void JNICALL
-Java_com_test_testgame_MainActivity_render(JNIEnv*, jobject) {
+Java_com_test_testgame_MainActivity_render(JNIEnv* env, jobject) {
     // handle render resize/initialization
     if (sPendingResize.load(std::memory_order_acquire)) {
         sPendingResize.store(false, std::memory_order_relaxed);
@@ -517,6 +589,8 @@ Java_com_test_testgame_MainActivity_render(JNIEnv*, jobject) {
     if (sFbo == 0 || gWidth == 0 || gHeight == 0) return;
 
     // Prepare rotation
+    uploadPendingImage(env);
+
     float target = sTargetAngle.load(std::memory_order_relaxed);
     sCurrentAngle += (target - sCurrentAngle) * kRotationLerpSpeed;
 
@@ -533,6 +607,9 @@ Java_com_test_testgame_MainActivity_render(JNIEnv*, jobject) {
     glUseProgram(sProgram);
     glUniform1f(sUAngleLoc, sCurrentAngle);
     glUniform1f(sUScaleLoc, sCurrentScale);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sImageTexture);
+    glUniform1i(sUTexLoc, 0);
 
     glBindVertexArray(sVao);
     glDrawArrays(GL_TRIANGLES, 0, kVertexCount);
@@ -582,4 +659,11 @@ Java_com_test_testgame_MainActivity_onDoubleTap(JNIEnv* /*env*/, jobject /*thiz*
     bool next = !sMagnified.load(std::memory_order_relaxed);
     sMagnified.store(next, std::memory_order_relaxed);
     LOGI("Double tap! Magnification %s", next ? "ON" : "OFF");
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_test_testgame_MainActivity_setImage(JNIEnv* env, jobject /*thiz*/, jobject bitmap) {
+    if (sPendingBitmap) env->DeleteGlobalRef(sPendingBitmap);
+    sPendingBitmap = env->NewGlobalRef(bitmap);
+    sNewImagePending.store(true, std::memory_order_release);
 }
