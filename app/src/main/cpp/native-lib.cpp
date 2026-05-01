@@ -2,14 +2,16 @@
  * renderer.cpp
  *
  * Native OpenGL ES 3.0 renderer for Android using the NDK.
- * Renders a rotating triangle, driven by tap input from the Java layer.
+ * Renders a rotating triangle/image, driven by gestures from the Java layer.
  *
  * Architecture overview:
- *   - Java/Kotlin calls initGL(), render(), setViewport(), and onTap() via JNI.
+ *   - Java/Kotlin calls initGL(), render(), setViewport(), onTap(), onDoubleTap(), and onFling() via JNI.
  *   - initGL()     : Sets up EGL display/surface/context and compiles shaders.
- *   - render()     : Called every frame; smoothly interpolates rotation and draws.
+ *   - render()     : Called every frame; smoothly interpolates rotation, scale, and translation.
  *   - setViewport(): Called on surface resize events.
  *   - onTap()      : Increments the target rotation angle by 90°.
+ *   - onDoubleTap(): Toggles between normal and magnified scale.
+ *   - onFling()    : Updates translation velocity for viewpoint movement.
  *
  * Threading note:
  *   targetAngle is an atomic<float> because onTap() may be called from the UI
@@ -24,6 +26,7 @@
 #include <GLES3/gl3.h>
 #include <cmath>
 #include <atomic>
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -39,10 +42,6 @@ static int gHeight;
 
 // ---------------------------------------------------------------------------
 // EGL state
-//
-// These represent the connection between the Android surface and the OpenGL
-// ES driver. They are initialised once in initGLInternal() and remain valid
-// for the lifetime of the surface.
 // ---------------------------------------------------------------------------
 
 static EGLDisplay sDisplay = EGL_NO_DISPLAY;
@@ -63,47 +62,80 @@ static GLuint sQuadVbo = 0;
 static GLuint sBlurProgram = 0;
 static GLuint sImageTexture = 0;
 
-// Location of the "uAngle" uniform inside the vertex shader.
-static GLint sUAngleLoc = -1;
-static GLint sUScaleLoc = -1;
+// Uniform locations
+static GLint sUTransformLoc = -1;
 static GLint sUTexLoc = -1;
 
 // ---------------------------------------------------------------------------
-// Rotation / Scale state
-//
-// targetAngle  : where we want to end up (written by the UI thread via onTap).
-// currentAngle : the angle actually passed to the shader each frame, smoothed
-//                toward targetAngle with a simple lerp.
+// Matrix Helpers (Column-major for OpenGL)
 // ---------------------------------------------------------------------------
 
+static void matrixIdentity(float* m) {
+    for (int i = 0; i < 16; i++) m[i] = 0;
+    m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+static void matrixMultiply(float* out, const float* a, const float* b) {
+    float tmp[16];
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            tmp[j * 4 + i] = 0;
+            for (int k = 0; k < 4; k++) {
+                tmp[j * 4 + i] += a[k * 4 + i] * b[j * 4 + k];
+            }
+        }
+    }
+    for (int i = 0; i < 16; i++) out[i] = tmp[i];
+}
+
+static void matrixTranslate(float* m, float tx, float ty, float tz) {
+    float t[16]; matrixIdentity(t);
+    t[12] = tx; t[13] = ty; t[14] = tz;
+    matrixMultiply(m, m, t);
+}
+
+static void matrixScale(float* m, float sx, float sy, float sz) {
+    float s[16]; matrixIdentity(s);
+    s[0] = sx; s[5] = sy; s[10] = sz;
+    matrixMultiply(m, m, s);
+}
+
+static void matrixRotateZ(float* m, float angle) {
+    float r[16]; matrixIdentity(r);
+    float c = cosf(angle); float s = sinf(angle);
+    r[0] = c;  r[1] = s;
+    r[4] = -s; r[5] = c;
+    matrixMultiply(m, m, r);
+}
+
+// ---------------------------------------------------------------------------
+// Animation State
+// ---------------------------------------------------------------------------
+
+// Rotation
 static std::atomic<float> sTargetAngle{0.0f};
 static float sCurrentAngle = 0.0f;
-
-// How fast currentAngle chases targetAngle (0 = never moves, 1 = instant snap).
 static constexpr float kRotationLerpSpeed = 0.1f;
-
-// Amount added to targetAngle per tap, in radians (90°).
 static constexpr float kTapRotationStep = static_cast<float>(M_PI) / 2.0f;
 
-// ---------------------------------------------------------------------------
-// Magnification state
-//
-// sMagnified      : toggled by double-tap; true = zoomed in.
-// sTargetScale    : 2.0 when magnified, 1.0 when normal.
-// sCurrentScale   : smoothly lerps toward sTargetScale each frame.
-// kScaleLerpSpeed : how fast the zoom animates (matches rotation feel).
-// kMagnifiedScale : the zoom factor applied when magnified.
-// ---------------------------------------------------------------------------
+// Scale
 static std::atomic<bool> sMagnified{false};
 static float sTargetScale  = 1.0f;
 static float sCurrentScale = 1.0f;
-
 static constexpr float kScaleLerpSpeed = 0.1f;
-static constexpr float kMagnifiedScale = 2.0f;
+static std::atomic<float> sNormalScale{1.0f};
+static std::atomic<float> sMagnifiedScale{2.0f};
+
+// Translation (Fling)
+static float sOffsetX = 0.0f;
+static float sOffsetY = 0.0f;
+static std::atomic<float> sVelX{0.0f};
+static std::atomic<float> sVelY{0.0f};
+static constexpr float kFriction = 0.96f; // Velocity decay per frame
+static constexpr float kVelocityScale = 0.00001f; // Convert pixels/sec to GL units/frame
 
 // ---------------------------------------------------------------------------
-// Pending viewport resize — written by setViewport (any thread),
-// consumed by render() (GL thread). Using atomics for thread safety.
+// Pending viewport resize
 // ---------------------------------------------------------------------------
 static std::atomic<int> sPendingWidth{0};
 static std::atomic<int> sPendingHeight{0};
@@ -122,18 +154,9 @@ static void initPostProcessing(int width, int height);
 static void resizePostProcessing(int width, int height);
 
 // ---------------------------------------------------------------------------
-// Geometry  (clip space, counter-clockwise winding)
+// Geometry
 // ---------------------------------------------------------------------------
 
-// Triagle Geometry
-/*static const GLfloat kVertices[] = {
-        0.0f,  0.5f, 0.0f,   // top
-        0.5f, -0.5f, 0.0f,   // bottom-right
-        -0.5f, -0.5f, 0.0f,   // bottom-left
-};
-static constexpr GLsizei kVertexCount = 3;*/
-
-// Image Geometry
 static const GLfloat kVertices[] = {
         // X,     Y,     Z,     U,     V
         -0.5f, 0.5f, 0.0f, 0.0f, 0.0f, // Top-Left
@@ -141,67 +164,43 @@ static const GLfloat kVertices[] = {
         0.5f, -0.5f, 0.0f, 1.0f, 1.0f, // Bottom-Right
 
         -0.5f, 0.5f, 0.0f, 0.0f, 0.0f, // Top-Left
-        0.5f, -0.5f, 0.0f, 1.0f, 1.0f, // Top-Left
-        0.5f, 0.5f, 0.0f, 1.0f, 0.0f, // Top-Left
+        0.5f, -0.5f, 0.0f, 1.0f, 1.0f, // Bottom-Right
+        0.5f, 0.5f, 0.0f, 1.0f, 0.0f, // Top-Right
 };
 static constexpr GLsizei kVertexCount = 6;
 
 // ---------------------------------------------------------------------------
 // GLSL shaders
-//
-// Using C++11 raw string literals (R"(...)") keeps the GLSL readable and
-// avoids manual escaping. This is the idiomatic modern approach for embedded
-// shaders in Android NDK projects — a full asset pipeline (loading from
-// APK assets) is the alternative, but is overkill for simple shaders.
 // ---------------------------------------------------------------------------
 
-// Vertex shader: rotates each vertex around the origin by uAngle (radians).
-//
-// NOTE: The #version directive must have no leading whitespace — the GLSL spec
-// forbids anything before it. Do not reformat or re-indent these raw strings.
 static const char* kVertexShaderSrc = R"GLSL(#version 300 es
-
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aTexCoord;
 
-uniform float uAngle;
-uniform float uScale;
+uniform mat4 uTransform;
 out vec2 vTexCoord;
 
 void main() {
-    float c = cos(uAngle);
-    float s = sin(uAngle);
-
-    // 2-D rotation matrix applied to the XY plane
-    vec2 rotated = vec2(
-        aPos.x * c - aPos.y * s,
-        aPos.x * s + aPos.y * c
-    );
-
-    gl_Position = vec4(rotated * uScale, 0.0, 1.0);
+    gl_Position = uTransform * vec4(aPos, 1.0);
     vTexCoord = aTexCoord;
 }
 )GLSL";
 
-// Fragment shader: outputs a solid red colour for every fragment.
 static const char* kFragmentShaderSrc = R"GLSL(#version 300 es
-
 precision mediump float;
 uniform sampler2D uTexture;
 in vec2 vTexCoord;
 out vec4 FragColor;
 
 void main() {
-    FragColor = texture(uTexture, vTexCoord); // Triangle: vec4(1.0, 0.0, 0.0, 1.0);
+    FragColor = texture(uTexture, vTexCoord);
 }
 )GLSL";
 
 static const char* kBlurVertexShaderSrc = R"GLSL(#version 300 es
 layout(location = 0) in vec2 aPos;
 layout(location = 1) in vec2 aTex;
-
 out vec2 TexCoords;
-
 void main() {
     TexCoords = aTex;
     gl_Position = vec4(aPos, 0.0, 1.0);
@@ -210,468 +209,280 @@ void main() {
 
 static const char* kBlurFragmentShaderSrc = R"GLSL(#version 300 es
 precision mediump float;
-
 in vec2 TexCoords;
 out vec4 FragColor;
-
 uniform sampler2D screenTexture;
 uniform vec2 uTexelSize;
-
 void main() {
     vec2 offsets[9] = vec2[](
-        vec2(-uTexelSize.x,  uTexelSize.y),  // top-left
-        vec2( 0.0,           uTexelSize.y),  // top-center
-        vec2( uTexelSize.x,  uTexelSize.y),  // top-right
-        vec2(-uTexelSize.x,  0.0),           // center-left
-        vec2( 0.0,           0.0),           // center
-        vec2( uTexelSize.x,  0.0),           // center-right
-        vec2(-uTexelSize.x, -uTexelSize.y),  // bottom-left
-        vec2( 0.0,          -uTexelSize.y),  // bottom-center
-        vec2( uTexelSize.x, -uTexelSize.y)   // bottom-right
+        vec2(-uTexelSize.x,  uTexelSize.y), vec2( 0.0,  uTexelSize.y), vec2( uTexelSize.x,  uTexelSize.y),
+        vec2(-uTexelSize.x,  0.0),          vec2( 0.0,  0.0),          vec2( uTexelSize.x,  0.0),
+        vec2(-uTexelSize.x, -uTexelSize.y), vec2( 0.0, -uTexelSize.y), vec2( uTexelSize.x, -uTexelSize.y)
     );
-
     float kernel[9] = float[](
         1.0/16.0, 2.0/16.0, 1.0/16.0,
-        2.0/16.0, 4.0/16.0, 2.0/16.0,
+        2.0/16.0, 4.0/16.0, 2.0/16.0, 
         1.0/16.0, 2.0/16.0, 1.0/16.0
     );
-
     vec3 col = vec3(0.0);
-
     for (int i = 0; i < 9; i++) {
         col += texture(screenTexture, TexCoords + offsets[i]).rgb * kernel[i];
     }
-
     FragColor = vec4(col, 1.0);
 }
 )GLSL";
 
 // ---------------------------------------------------------------------------
-// Shader helpers
+// Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Compiles a single shader stage and returns its handle.
- * Logs the info log on failure; the caller should check GL_COMPILE_STATUS
- * if stricter error handling is needed.
- */
 static GLuint compileShader(GLenum type, const char* src) {
     GLuint shader = glCreateShader(type);
     glShaderSource(shader, 1, &src, nullptr);
     glCompileShader(shader);
-
     GLint success = GL_FALSE;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
     if (!success) {
         char info[512];
         glGetShaderInfoLog(shader, sizeof(info), nullptr, info);
-        LOGE("Shader compile error (type=0x%x): %s", type, info);
+        LOGE("Shader compile error: %s", info);
     }
     return shader;
 }
 
-/**
- * Links a vertex and fragment shader into a program.
- * Returns the program handle, or 0 on link failure.
- * Intermediate shader objects are deleted regardless of outcome.
- */
 static GLuint buildProgram(const char* vertSrc, const char* fragSrc) {
-    GLuint vert = compileShader(GL_VERTEX_SHADER,   vertSrc);
+    GLuint vert = compileShader(GL_VERTEX_SHADER, vertSrc);
     GLuint frag = compileShader(GL_FRAGMENT_SHADER, fragSrc);
-
     GLuint prog = glCreateProgram();
     glAttachShader(prog, vert);
     glAttachShader(prog, frag);
     glLinkProgram(prog);
-
-    // Shader objects are no longer needed once linked into the program.
     glDeleteShader(vert);
     glDeleteShader(frag);
-
-    GLint linked = GL_FALSE;
-    glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-    if (!linked) {
-        char info[512];
-        glGetProgramInfoLog(prog, sizeof(info), nullptr, info);
-        LOGE("Program link error: %s", info);
-        glDeleteProgram(prog);
-        return 0;
-    }
-
     return prog;
 }
 
-// ---------------------------------------------------------------------------
-// Core initialisation — one function per responsibility
-// ---------------------------------------------------------------------------
-
-/**
- * initEGL()
- * Creates the EGL display, picks a config, and makes the context current.
- *
- * EGL is the platform glue between Android's windowing system and OpenGL ES.
- * This must succeed before any GL call is valid.
- */
 static void initEGL(ANativeWindow* window) {
     sDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     eglInitialize(sDisplay, nullptr, nullptr);
-
-    // Request an OpenGL ES 3 capable, RGB-888 window surface.
-    const EGLint configAttribs[] = {
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-            EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
-            EGL_RED_SIZE,        8,
-            EGL_GREEN_SIZE,      8,
-            EGL_BLUE_SIZE,       8,
-            EGL_NONE
-    };
-    EGLConfig config;
-    EGLint    numConfigs = 0;
+    const EGLint configAttribs[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE };
+    EGLConfig config; EGLint numConfigs = 0;
     eglChooseConfig(sDisplay, configAttribs, &config, 1, &numConfigs);
-
     sSurface = eglCreateWindowSurface(sDisplay, config, window, nullptr);
-
     const EGLint ctxAttribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
     sContext = eglCreateContext(sDisplay, config, EGL_NO_CONTEXT, ctxAttribs);
-
     eglMakeCurrent(sDisplay, sSurface, sSurface, sContext);
-    LOGI("EGL initialised.");
 }
 
-/**
- * initGeometry()
- * Uploads the triangle's vertex data to the GPU and records the attribute
- * layout inside a VAO.
- *
- * The VAO captures the VBO binding and glVertexAttribPointer state so that
- * render() only needs a single glBindVertexArray() call per frame.
- */
 static void initGeometry() {
     glGenVertexArrays(1, &sVao);
     glBindVertexArray(sVao);
-
     glGenBuffers(1, &sVbo);
     glBindBuffer(GL_ARRAY_BUFFER, sVbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(kVertices), kVertices, GL_STATIC_DRAW);
-
-    // Attribute 0: vec3 position, tightly packed, no offset.
-    // Pos: location 0
-    glVertexAttribPointer(
-            /*index=*/      0,
-            /*size=*/       3,
-            /*type=*/       GL_FLOAT,
-            /*normalized=*/ GL_FALSE,
-            /*stride=*/     5 * sizeof(GLfloat), // 3 for Triangle
-            /*offset=*/     nullptr
-    );
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), nullptr);
     glEnableVertexAttribArray(0);
-
-    // UV: location 1
-    glVertexAttribPointer(
-            /*index=*/      1,
-            /*size=*/       2,
-            /*type=*/       GL_FLOAT,
-            /*normalized=*/ GL_FALSE,
-            /*stride=*/     5 * sizeof(GLfloat), // 3 for Triangle
-            /*offset=*/     (void *)(3 * sizeof(GLfloat))
-    );
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (void *)(3 * sizeof(GLfloat)));
     glEnableVertexAttribArray(1);
-    glBindVertexArray(0);  // Unbind so later code cannot accidentally mutate the VAO.
-    LOGI("Geometry uploaded (%d vertices).", kVertexCount);
+    glBindVertexArray(0);
 }
 
-/**
- * initShaders()
- * Compiles and links the shader program, then caches uniform locations.
- *
- * Uniform locations are looked up once here rather than every frame;
- * glGetUniformLocation is not free and should never sit in the render loop.
- */
 static void initShaders() {
-    sProgram   = buildProgram(kVertexShaderSrc, kFragmentShaderSrc);
-    sUAngleLoc = glGetUniformLocation(sProgram, "uAngle");
-    sUScaleLoc = glGetUniformLocation(sProgram, "uScale");
-    sUTexLoc   = glGetUniformLocation(sProgram, "uTexture");
+    sProgram = buildProgram(kVertexShaderSrc, kFragmentShaderSrc);
+    sUTransformLoc = glGetUniformLocation(sProgram, "uTransform");
+    sUTexLoc = glGetUniformLocation(sProgram, "uTexture");
 
     glGenTextures(1, &sImageTexture);
     glBindTexture(GL_TEXTURE_2D, sImageTexture);
-    unsigned char pixels[] = {255, 0, 0 , 255}; // Red
+    unsigned char pixels[] = {255, 0, 0 , 255};
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    LOGI("Shaders compiled. uAngle location: %d", sUAngleLoc);
 }
 
 static void initPostProcessing(int width, int height) {
-    // -----------------------------
-    // 1. Create framebuffer
-    // -----------------------------
     glGenFramebuffers(1, &sFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
-
-    // -----------------------------
-    // 2. Create color texture
-    // -----------------------------
     glGenTextures(1, &sColorTexture);
     glBindTexture(GL_TEXTURE_2D, sColorTexture);
-
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-
-    // Filtering
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    // prevent edge artifacts
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-    // Attach texture to framebuffer
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, sColorTexture, 0);
-
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        LOGE("Framebuffer not complete!");
-    }
-
-    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (status != GL_FRAMEBUFFER_COMPLETE) {
-        LOGE("FBO incomplete! status=0x%x", status);
-    } else {
-        LOGI("FBO complete at %dx%d", width, height);
-    }
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sColorTexture, 0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-    // -----------------------------
-    // 3. Fullscreen quad
-    // -----------------------------
-    float quadVertices[] = {
-            -1.0f,  1.0f,  0.0f, 1.0f,
-            -1.0f, -1.0f,  0.0f, 0.0f,
-            1.0f, -1.0f,  1.0f, 0.0f,
-            -1.0f,  1.0f,  0.0f, 1.0f,
-            1.0f, -1.0f,  1.0f, 0.0f,
-            1.0f,  1.0f,  1.0f, 1.0f
-    };
-
+    float quadVertices[] = { -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, -1.0f, 0.0f, 0.0f, 1.0f, -1.0f, 1.0f, 0.0f, -1.0f, 1.0f, 0.0f, 1.0f, 1.0f, -1.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f };
     glGenVertexArrays(1, &sQuadVao);
     glGenBuffers(1, &sQuadVbo);
-
     glBindVertexArray(sQuadVao);
     glBindBuffer(GL_ARRAY_BUFFER, sQuadVbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
-
-    // position (location = 0)
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)nullptr);
     glEnableVertexAttribArray(0);
-
-    // (location = 1)
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float),
-                          (void*)(2*sizeof(float)));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*sizeof(float), (void*)(2*sizeof(float)));
     glEnableVertexAttribArray(1);
-
     glBindVertexArray(0);
 
-    // -----------------------------
-    // 4. Blur shader
-    // -----------------------------
     sBlurProgram = buildProgram(kBlurVertexShaderSrc, kBlurFragmentShaderSrc);
-
     glUseProgram(sBlurProgram);
-
     glUniform1i(glGetUniformLocation(sBlurProgram, "screenTexture"), 0);
-    glUniform2f(glGetUniformLocation(sBlurProgram, "uTexelSize"),
-                1.0f / (float)width, 1.0f / (float)height);
-
-    LOGI("Post-processing initialised at %dx%d.", width, height);
+    glUniform2f(glGetUniformLocation(sBlurProgram, "uTexelSize"), 1.0f / (float)width, 1.0f / (float)height);
 }
 
-// Called on subsequent resizes only.
 static void resizePostProcessing(int width, int height) {
     glBindTexture(GL_TEXTURE_2D, sColorTexture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0,
-                 GL_RGB, GL_UNSIGNED_BYTE, nullptr);
-
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
     glUseProgram(sBlurProgram);
-    glUniform2f(glGetUniformLocation(sBlurProgram, "uTexelSize"),
-                1.0f / (float)width, 1.0f / (float)height);
-
-    LOGI("Post-processing resized to %dx%d.", width, height);
+    glUniform2f(glGetUniformLocation(sBlurProgram, "uTexelSize"), 1.0f / (float)width, 1.0f / (float)height);
 }
-
-/**
- * initGLInternal()
- * Top-level coordinator: calls the three initialisation stages in order.
- * Each stage has a single, clearly named responsibility.
- *
- * Must be called from the GL/render thread.
- */
-/*static void initGLInternal(ANativeWindow* window) {
-    initEGL(window);       // 1. Connect to the display, create GL context
-    initGeometry();        // 2. Upload mesh data to the GPU
-    initShaders();         // 3. Compile shaders, cache uniform locations
-
-    LOGI("GL initialisation complete. Renderer: %s", glGetString(GL_RENDERER));
-}*/
 
 static void uploadPendingImage(JNIEnv *env) {
     if (!sNewImagePending.load(std::memory_order_acquire)) return;
-
-    AndroidBitmapInfo info;
-    void *pixels = nullptr;
-    if (AndroidBitmap_getInfo(env, sPendingBitmap, &info) < 0)  return;
+    AndroidBitmapInfo info; void *pixels = nullptr;
+    if (AndroidBitmap_getInfo(env, sPendingBitmap, &info) < 0) return;
     if (AndroidBitmap_lockPixels(env, sPendingBitmap, &pixels) < 0) return;
-
-    // ---------------------------------------------------------------------------
-    // Pixel manipulation: if RGB is close to red, make it purple.
     if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
-        unsigned char* data = (unsigned char*)pixels;
+        unsigned char* d = (unsigned char*)pixels;
         for (unsigned int i = 0; i < info.width * info.height * 4; i += 4) {
-            // RGBA_8888: [i]=R, [i+1]=G, [i+2]=B, [i+3]=A
-            if (data[i] > 200 && data[i + 1] < 100 && data[i + 2] < 100) {
-                data[i + 2] = 255; // Boost Blue to turn Red into Purple
-            }
+            if (d[i] > 200 && d[i + 1] < 100 && d[i + 2] < 100) d[i + 2] = 255;
         }
     }
-    // ---------------------------------------------------------------------------
-
     glBindTexture(GL_TEXTURE_2D, sImageTexture);
-    GLint format = (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) ? GL_RGBA : GL_RGB;
-    glTexImage2D(GL_TEXTURE_2D, 0, format, info.width, info.height, 0, format, GL_UNSIGNED_BYTE, pixels);
+    GLint f = (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) ? GL_RGBA : GL_RGB;
+    glTexImage2D(GL_TEXTURE_2D, 0, f, (GLsizei)info.width, (GLsizei)info.height, 0, (GLenum)f, GL_UNSIGNED_BYTE, pixels);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
     AndroidBitmap_unlockPixels(env, sPendingBitmap);
-    env->DeleteGlobalRef(sPendingBitmap);
-    sPendingBitmap = nullptr;
+    env->DeleteGlobalRef(sPendingBitmap); sPendingBitmap = nullptr;
     sNewImagePending.store(false, std::memory_order_release);
-    LOGI("Image uploaded.");
 }
 
 // ---------------------------------------------------------------------------
 // JNI entry points
-// Called by MainActivity on the render/UI threads respectively.
 // ---------------------------------------------------------------------------
 
-/**
- * initGL(Surface surface)
- * Sets up EGL and OpenGL for the given Android Surface.
- * Called once when the SurfaceView is ready.
- */
 extern "C" JNIEXPORT void JNICALL
 Java_com_test_testgame_MainActivity_initGL(JNIEnv* env, jobject /*thiz*/, jobject surfaceObj) {
+    sProgram = 0; sVbo = 0; sVao = 0; sFbo = 0; sColorTexture = 0;
+    sQuadVao = 0; sQuadVbo = 0; sBlurProgram = 0; sImageTexture = 0;
+
     ANativeWindow* window = ANativeWindow_fromSurface(env, surfaceObj);
     initEGL(window);
     initGeometry();
     initShaders();
-    ANativeWindow_release(window);  // EGL holds its own reference; we can release ours.
+    ANativeWindow_release(window);
+    LOGI("GL initialized in new context.");
 }
 
-/**
- * render()
- * Advances the rotation lerp, clears the screen, and draws the triangle.
- * Called every frame from the render loop (typically a Choreographer callback).
- */
+extern "C" JNIEXPORT void JNICALL
+Java_com_test_testgame_MainActivity_terminateGL(JNIEnv* /*env*/, jobject /*thiz*/) {
+    if (sDisplay != EGL_NO_DISPLAY) {
+        eglMakeCurrent(sDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (sContext != EGL_NO_CONTEXT) eglDestroyContext(sDisplay, sContext);
+        if (sSurface != EGL_NO_SURFACE) eglDestroySurface(sDisplay, sSurface);
+        eglTerminate(sDisplay);
+    }
+    sDisplay = EGL_NO_DISPLAY; sSurface = EGL_NO_SURFACE; sContext = EGL_NO_CONTEXT;
+    gWidth = 0; gHeight = 0;
+    LOGI("GL terminated.");
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_test_testgame_MainActivity_render(JNIEnv* env, jobject) {
-    // handle render resize/initialization
     if (sPendingResize.load(std::memory_order_acquire)) {
         sPendingResize.store(false, std::memory_order_relaxed);
-
         int w = sPendingWidth.load(std::memory_order_relaxed);
         int h = sPendingHeight.load(std::memory_order_relaxed);
-
         if (w > 0 && h > 0) {
-            gWidth  = w;
-            gHeight = h;
+            gWidth  = w; gHeight = h;
             glViewport(0, 0, w, h);
-
-            if (sFbo == 0) {
-                // create all post-processing resources.
-                initPostProcessing(w, h);
-            } else {
-                // update texture and uniforms only.
-                resizePostProcessing(w, h);
-            }
+            if (sFbo == 0) initPostProcessing(w, h);
+            else resizePostProcessing(w, h);
         }
     }
-
-    // don't draw until post-processing is ready.
     if (sFbo == 0 || gWidth == 0 || gHeight == 0) return;
 
-    // Prepare rotation
     uploadPendingImage(env);
 
+    // Update States
     float target = sTargetAngle.load(std::memory_order_relaxed);
     sCurrentAngle += (target - sCurrentAngle) * kRotationLerpSpeed;
 
-    // interpolate to scale
-    sTargetScale   = sMagnified.load(std::memory_order_relaxed) ? kMagnifiedScale : 1.0f;
+    float bS = sNormalScale.load(std::memory_order_relaxed);
+    float mS = sMagnifiedScale.load(std::memory_order_relaxed);
+    sTargetScale   = sMagnified.load(std::memory_order_relaxed) ? mS : bS;
     sCurrentScale += (sTargetScale - sCurrentScale) * kScaleLerpSpeed;
 
-    // ── Pass 1: render triangle
+    // Fling Physics
+    float vx = sVelX.load(std::memory_order_relaxed);
+    float vy = sVelY.load(std::memory_order_relaxed);
+    float aspectX = ((gHeight>gWidth) ? gHeight/gWidth : 1);
+    float aspectY = ((gWidth>gHeight) ? gWidth/gHeight : 1);;
+    // scale scroll speed back to 1 to 1
+    sOffsetX += vx * kVelocityScale * aspectX;
+    sOffsetY -= vy * kVelocityScale * aspectY;
+    sVelX.store(vx * kFriction, std::memory_order_relaxed);
+    sVelY.store(vy * kFriction, std::memory_order_relaxed);
+    sOffsetX = std::max(-2.0f, std::min(2.0f, sOffsetX));
+    sOffsetY = std::max(-2.0f, std::min(2.0f, sOffsetY));
+
+    // ─── CALCULATE TRANSFORMATION MATRIX ───
+    float transform[16];
+    matrixIdentity(transform);
+    // Order: Translation * Scale * Rotation
+    matrixTranslate(transform, sOffsetX, sOffsetY, 0.0f);
+    matrixScale(transform, sCurrentScale, sCurrentScale, 1.0f);
+    matrixRotateZ(transform, sCurrentAngle);
+
+    // Pass 1: Render Image
     glBindFramebuffer(GL_FRAMEBUFFER, sFbo);
     glViewport(0, 0, gWidth, gHeight);
-    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f); glClear(GL_COLOR_BUFFER_BIT);
 
     glUseProgram(sProgram);
-    glUniform1f(sUAngleLoc, sCurrentAngle);
-    glUniform1f(sUScaleLoc, sCurrentScale);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, sImageTexture);
+    glUniformMatrix4fv(sUTransformLoc, 1, GL_FALSE, transform);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, sImageTexture);
     glUniform1i(sUTexLoc, 0);
 
-    glBindVertexArray(sVao);
-    glDrawArrays(GL_TRIANGLES, 0, kVertexCount);
+    glBindVertexArray(sVao); glDrawArrays(GL_TRIANGLES, 0, kVertexCount);
 
-    // ── Pass 2: apply blur
+    // Pass 2: Blur
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glViewport(0, 0, gWidth, gHeight);
     glClear(GL_COLOR_BUFFER_BIT);
-
     glUseProgram(sBlurProgram);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, sColorTexture);
-    glBindVertexArray(sQuadVao);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, sColorTexture);
+    glBindVertexArray(sQuadVao); glDrawArrays(GL_TRIANGLES, 0, 6);
 
     eglSwapBuffers(sDisplay, sSurface);
 }
 
-/**
- * setViewport(int w, int h)
- * Updates the GL viewport to match the current surface dimensions.
- * Called whenever the surface is created or resized.
- */
 extern "C" JNIEXPORT void JNICALL
 Java_com_test_testgame_MainActivity_setViewport(JNIEnv* /*env*/, jobject /*thiz*/, jint w, jint h) {
-    // Store new Viewport Dimensions
-    sPendingWidth.store(w,  std::memory_order_relaxed);
+    sPendingWidth.store(w, std::memory_order_relaxed);
     sPendingHeight.store(h, std::memory_order_relaxed);
     sPendingResize.store(true, std::memory_order_release);
-    LOGI("setViewport: queued resize to %d x %d", w, h);
 }
 
-/**
- * onTap()
- * Advances the target rotation by 90° each time the screen is tapped.
- * Safe to call from the UI thread; uses atomic store.
- */
 extern "C" JNIEXPORT void JNICALL
 Java_com_test_testgame_MainActivity_onSingleTap(JNIEnv* /*env*/, jobject /*thiz*/) {
-    float next = sTargetAngle.load(std::memory_order_relaxed) + kTapRotationStep;
-    sTargetAngle.store(next, std::memory_order_relaxed);
-    LOGI("Tap! Target angle now: %.4f rad (%.1f deg)", next, next * (180.0f / M_PI));
+    float n = sTargetAngle.load(std::memory_order_relaxed) + kTapRotationStep;
+    sTargetAngle.store(n, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_test_testgame_MainActivity_onDoubleTap(JNIEnv* /*env*/, jobject /*thiz*/) {
-    bool next = !sMagnified.load(std::memory_order_relaxed);
-    sMagnified.store(next, std::memory_order_relaxed);
-    LOGI("Double tap! Magnification %s", next ? "ON" : "OFF");
+    sMagnified.store(!sMagnified.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_test_testgame_MainActivity_onFling(JNIEnv* /*env*/, jobject /*thiz*/, jfloat vx, jfloat vy) {
+    sVelX.store(vx, std::memory_order_relaxed);
+    sVelY.store(vy, std::memory_order_relaxed);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -679,4 +490,10 @@ Java_com_test_testgame_MainActivity_setImage(JNIEnv* env, jobject /*thiz*/, jobj
     if (sPendingBitmap) env->DeleteGlobalRef(sPendingBitmap);
     sPendingBitmap = env->NewGlobalRef(bitmap);
     sNewImagePending.store(true, std::memory_order_release);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_test_testgame_MainActivity_setZoomLevels(JNIEnv* /*env*/, jobject /*thiz*/, jfloat normal, jfloat magnified) {
+    sNormalScale.store(normal, std::memory_order_relaxed);
+    sMagnifiedScale.store(magnified, std::memory_order_relaxed);
 }

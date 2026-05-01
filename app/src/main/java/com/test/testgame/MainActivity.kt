@@ -8,9 +8,16 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import androidx.activity.result.PickVisualMediaRequest
+import android.view.View
+import android.widget.FrameLayout
+import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.ActionBarDrawerToggle
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.Toolbar
+import androidx.drawerlayout.widget.DrawerLayout
+import com.google.android.material.navigation.NavigationView
+import com.google.android.material.slider.RangeSlider
 
 class MainActivity : AppCompatActivity() {
 
@@ -18,7 +25,6 @@ class MainActivity : AppCompatActivity() {
     private var renderThread: Thread? = null
     @Volatile private var glReady = false
 
-    // Image picker
     private val pickMedia = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
             loadBitmapFromUri(uri)
@@ -27,27 +33,43 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        val toolbar: Toolbar = findViewById(R.id.toolbar)
+        setSupportActionBar(toolbar)
+
+        val drawerLayout: DrawerLayout = findViewById(R.id.drawer_layout)
+        val toggle = ActionBarDrawerToggle(
+            this, drawerLayout, toolbar,
+            R.string.navigation_drawer_open, R.string.navigation_drawer_close
+        )
+        drawerLayout.addDrawerListener(toggle)
+        toggle.syncState()
+
+        val navView: NavigationView = findViewById(R.id.nav_view)
+        if (navView.headerCount > 0) {
+            setupDrawerControls(navView.getHeaderView(0))
+        }
 
         surfaceView = SurfaceView(this)
-        setContentView(surfaceView)
+        findViewById<FrameLayout>(R.id.container).addView(surfaceView)
 
-        // GestureDetector handles the complexity of distinguishing between single tap, double tap, and long press.
         val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean = true
-
-            // Triggered only after it's confirmed not to be a double tap or long press
             override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
                 onSingleTap()
                 return true
             }
-
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 onDoubleTap()
                 return true
             }
-
             override fun onLongPress(e: MotionEvent) {
-                pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                pickMedia.launch(androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            }
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                onFling(velocityX, velocityY)
+                return true
             }
         })
 
@@ -63,6 +85,10 @@ class MainActivity : AppCompatActivity() {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 renderThread = Thread {
                     initGL(holder.surface)
+                    
+                    lastBitmap?.let { setImage(it) }
+                    setZoomLevels(savedNormalZoom, savedMagZoom)
+                    
                     glReady = true
                     while (!Thread.currentThread().isInterrupted) {
                         render()
@@ -86,27 +112,59 @@ class MainActivity : AppCompatActivity() {
                 glReady = false
                 renderThread?.interrupt()
                 renderThread?.join()
+                terminateGL()
             }
         })
+    }
+
+    private fun setupDrawerControls(header: View) {
+        val rangeSlider: RangeSlider? = header.findViewById(R.id.zoom_range_slider)
+        val valueText: TextView? = header.findViewById(R.id.zoom_values_text)
+
+        if (rangeSlider != null && valueText != null) {
+            rangeSlider.values = listOf(savedNormalZoom, savedMagZoom)
+            valueText.text = String.format("Range: %.1fx - %.1fx", savedNormalZoom, savedMagZoom)
+            
+            rangeSlider.addOnChangeListener { slider, _, _ ->
+                val currentValues = slider.values
+                if (currentValues.size >= 2) {
+                    val normal = currentValues[0]
+                    val magnified = currentValues[1]
+                    valueText.text = String.format("Range: %.1fx - %.1fx", normal, magnified)
+                    
+                    setZoomLevels(normal, magnified)
+                    savedNormalZoom = normal
+                    savedMagZoom = magnified
+                }
+            }
+        }
     }
 
     private fun loadBitmapFromUri(uri: Uri) {
         contentResolver.openInputStream(uri)?.use { inputStream ->
             val bitmap = BitmapFactory.decodeStream(inputStream)
             if (bitmap != null) {
+                lastBitmap = bitmap
                 setImage(bitmap)
             }
         }
     }
 
     external fun initGL(surface: android.view.Surface)
+    external fun terminateGL()
     external fun render()
     external fun setViewport(width: Int, height: Int)
     external fun onSingleTap()
     external fun onDoubleTap()
+    external fun onFling(velocityX: Float, velocityY: Float)
     external fun setImage(bitmap: Bitmap)
+    external fun setZoomLevels(normal: Float, magnified: Float)
 
     companion object {
+        private var lastBitmap: Bitmap? = null
+        private var savedNormalZoom: Float = 1.0f
+        private var savedMagZoom: Float = 2.0f
+
         init {
             System.loadLibrary("testgame")
         }
