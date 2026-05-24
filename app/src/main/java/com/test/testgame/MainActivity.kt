@@ -9,7 +9,10 @@ import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.FrameLayout
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.ActionBarDrawerToggle
@@ -24,6 +27,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var surfaceView: SurfaceView
     private var renderThread: Thread? = null
     @Volatile private var glReady = false
+    private var filterFiles: Array<String> = emptyArray()
 
     private val pickMedia = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
@@ -117,9 +121,24 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    private fun applyFilter(fileName: String) {
+        try {
+            val content = assets.open("filters/$fileName").bufferedReader().use { it.readText() }
+            val matrix = content.split(",")
+                .map { it.trim().toFloat() }
+                .toFloatArray()
+            if (matrix.size == 16) {
+                setMagnificationMatrix(matrix)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
     private fun setupDrawerControls(header: View) {
         val rangeSlider: RangeSlider? = header.findViewById(R.id.zoom_range_slider)
         val valueText: TextView? = header.findViewById(R.id.zoom_values_text)
+        val filterSpinner: Spinner? = header.findViewById(R.id.filter_spinner)
 
         if (rangeSlider != null && valueText != null) {
             rangeSlider.values = listOf(savedNormalZoom, savedMagZoom)
@@ -136,6 +155,21 @@ class MainActivity : AppCompatActivity() {
                     savedNormalZoom = normal
                     savedMagZoom = magnified
                 }
+            }
+        }
+
+        filterSpinner?.let { spinner ->
+            filterFiles = assets.list("filters") ?: emptyArray()
+            val displayNames = filterFiles.map { it.substringBeforeLast(".") }
+            val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, displayNames)
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            spinner.adapter = adapter
+
+            spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                    applyFilter(filterFiles[position])
+                }
+                override fun onNothingSelected(parent: AdapterView<*>?) {}
             }
         }
     }
@@ -159,6 +193,7 @@ class MainActivity : AppCompatActivity() {
     external fun onFling(velocityX: Float, velocityY: Float)
     external fun setImage(bitmap: Bitmap)
     external fun setZoomLevels(normal: Float, magnified: Float)
+    external fun setMagnificationMatrix(matrix: FloatArray)
 
     companion object {
         private var lastBitmap: Bitmap? = null

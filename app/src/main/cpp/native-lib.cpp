@@ -65,6 +65,8 @@ static GLuint sImageTexture = 0;
 // Uniform locations
 static GLint sUTransformLoc = -1;
 static GLint sUTexLoc = -1;
+static GLint sUMagnifiedLoc = -1;
+static GLint sUDistortionLoc = -1;
 
 // ---------------------------------------------------------------------------
 // Matrix Helpers (Column-major for OpenGL)
@@ -126,12 +128,20 @@ static constexpr float kScaleLerpSpeed = 0.1f;
 static std::atomic<float> sNormalScale{1.0f};
 static std::atomic<float> sMagnifiedScale{2.0f};
 
+// Custom Magnification Matrix
+static float sMagnifiedMatrix[16] = {
+    1.0f, 0.0f, 0.0f, 0.0f,
+    0.0f, 1.0f, 0.0f, 0.0f,
+    0.0f, 0.0f, 1.0f, 0.0f,
+    0.0f, 0.0f, 0.0f, 1.0f
+};
+
 // Translation (Fling)
 static float sOffsetX = 0.0f;
 static float sOffsetY = 0.0f;
 static std::atomic<float> sVelX{0.0f};
 static std::atomic<float> sVelY{0.0f};
-static constexpr float kFriction = 0.96f; // Velocity decay per frame
+static constexpr float kFriction = 0.95f; // Velocity decay per frame
 static constexpr float kVelocityScale = 0.00001f; // Convert pixels/sec to GL units/frame
 
 // ---------------------------------------------------------------------------
@@ -189,11 +199,25 @@ void main() {
 static const char* kFragmentShaderSrc = R"GLSL(#version 300 es
 precision mediump float;
 uniform sampler2D uTexture;
+uniform bool uMagnified;
+uniform float uDistortion;
 in vec2 vTexCoord;
 out vec4 FragColor;
 
 void main() {
-    FragColor = texture(uTexture, vTexCoord);
+    vec2 uv = vTexCoord;
+    if (uMagnified && uDistortion != 0.0) {
+        vec2 p = vTexCoord - 0.5;
+        float r = length(p);
+        float f = 1.0 + uDistortion * r * r;
+        uv = 0.5 + p * f;
+    }
+    
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
+        FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+    } else {
+        FragColor = texture(uTexture, uv);
+    }
 }
 )GLSL";
 
@@ -291,6 +315,8 @@ static void initShaders() {
     sProgram = buildProgram(kVertexShaderSrc, kFragmentShaderSrc);
     sUTransformLoc = glGetUniformLocation(sProgram, "uTransform");
     sUTexLoc = glGetUniformLocation(sProgram, "uTexture");
+    sUMagnifiedLoc = glGetUniformLocation(sProgram, "uMagnified");
+    sUDistortionLoc = glGetUniformLocation(sProgram, "uDistortion");
 
     glGenTextures(1, &sImageTexture);
     glBindTexture(GL_TEXTURE_2D, sImageTexture);
@@ -343,12 +369,13 @@ static void uploadPendingImage(JNIEnv *env) {
     AndroidBitmapInfo info; void *pixels = nullptr;
     if (AndroidBitmap_getInfo(env, sPendingBitmap, &info) < 0) return;
     if (AndroidBitmap_lockPixels(env, sPendingBitmap, &pixels) < 0) return;
+    /* Check for red pixels and add blue to them
     if (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) {
         unsigned char* d = (unsigned char*)pixels;
         for (unsigned int i = 0; i < info.width * info.height * 4; i += 4) {
             if (d[i] > 200 && d[i + 1] < 100 && d[i + 2] < 100) d[i + 2] = 255;
         }
-    }
+    }*/
     glBindTexture(GL_TEXTURE_2D, sImageTexture);
     GLint f = (info.format == ANDROID_BITMAP_FORMAT_RGBA_8888) ? GL_RGBA : GL_RGB;
     glTexImage2D(GL_TEXTURE_2D, 0, f, (GLsizei)info.width, (GLsizei)info.height, 0, (GLenum)f, GL_UNSIGNED_BYTE, pixels);
@@ -418,24 +445,48 @@ Java_com_test_testgame_MainActivity_render(JNIEnv* env, jobject) {
     sCurrentScale += (sTargetScale - sCurrentScale) * kScaleLerpSpeed;
 
     // Fling Physics
-    float vx = sVelX.load(std::memory_order_relaxed);
-    float vy = sVelY.load(std::memory_order_relaxed);
-    float aspectX = ((gHeight>gWidth) ? gHeight/gWidth : 1);
-    float aspectY = ((gWidth>gHeight) ? gWidth/gHeight : 1);;
-    // scale scroll speed back to 1 to 1
-    sOffsetX += vx * kVelocityScale * aspectX;
-    sOffsetY -= vy * kVelocityScale * aspectY;
-    sVelX.store(vx * kFriction, std::memory_order_relaxed);
-    sVelY.store(vy * kFriction, std::memory_order_relaxed);
+    static float sRenderVelX = 0.0f;
+    static float sRenderVelY = 0.0f;
+
+    // Consume new fling impulses from UI thread
+    float vX = sVelX.exchange(0.0f, std::memory_order_relaxed);
+    float vY = sVelY.exchange(0.0f, std::memory_order_relaxed);
+    if (vX != 0.0f || vY != 0.0f) {
+        sRenderVelX = vX;
+        sRenderVelY = vY;
+    }
+
+    float aspectX = (gHeight > gWidth) ? (float)gHeight / (float)gWidth : 1.0f;
+    float aspectY = (gWidth > gHeight) ? (float)gWidth / (float)gHeight : 1.0f;
+
+    sOffsetX += sRenderVelX * kVelocityScale * aspectX;
+    sOffsetY -= sRenderVelY * kVelocityScale * aspectY;
+
+    sRenderVelX *= kFriction;
+    sRenderVelY *= kFriction;
+
+    // Prevent tiny infinite updates
+    if (std::abs(sRenderVelX) < 0.1f) sRenderVelX = 0.0f;
+    if (std::abs(sRenderVelY) < 0.1f) sRenderVelY = 0.0f;
+
     sOffsetX = std::max(-2.0f, std::min(2.0f, sOffsetX));
     sOffsetY = std::max(-2.0f, std::min(2.0f, sOffsetY));
 
     // ─── CALCULATE TRANSFORMATION MATRIX ───
     float transform[16];
     matrixIdentity(transform);
-    // Order: Translation * Scale * Rotation
+    // Order: Translation * Scale * Custom Filter * Rotation
     matrixTranslate(transform, sOffsetX, sOffsetY, 0.0f);
     matrixScale(transform, sCurrentScale, sCurrentScale, 1.0f);
+
+    bool magnified = sMagnified.load(std::memory_order_relaxed);
+    // Apply custom magnification matrix always (filter)
+    matrixMultiply(transform, transform, sMagnifiedMatrix);
+    /* Apply custom magnification matrix only if magnified
+    if (magnified) {
+        matrixMultiply(transform, transform, sMagnifiedMatrix);
+    }*/
+    
     matrixRotateZ(transform, sCurrentAngle);
 
     // Pass 1: Render Image
@@ -447,6 +498,8 @@ Java_com_test_testgame_MainActivity_render(JNIEnv* env, jobject) {
     glUniformMatrix4fv(sUTransformLoc, 1, GL_FALSE, transform);
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, sImageTexture);
     glUniform1i(sUTexLoc, 0);
+    glUniform1i(sUMagnifiedLoc, true);
+    glUniform1f(sUDistortionLoc, sMagnifiedMatrix[11]);
 
     glBindVertexArray(sVao); glDrawArrays(GL_TRIANGLES, 0, kVertexCount);
 
@@ -496,4 +549,23 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_test_testgame_MainActivity_setZoomLevels(JNIEnv* /*env*/, jobject /*thiz*/, jfloat normal, jfloat magnified) {
     sNormalScale.store(normal, std::memory_order_relaxed);
     sMagnifiedScale.store(magnified, std::memory_order_relaxed);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_test_testgame_MainActivity_setMagnificationMatrix(JNIEnv* env, jobject /*thiz*/, jfloatArray matrix) {
+    jfloat* elems = env->GetFloatArrayElements(matrix, nullptr);
+    for (int i = 0; i < 16; i++) {
+        sMagnifiedMatrix[i] = elems[i];
+    }
+    env->ReleaseFloatArrayElements(matrix, elems, JNI_ABORT);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_test_testgame_MainActivity_isMagnified(JNIEnv* /*env*/, jobject /*thiz*/) {
+    return sMagnified.load(std::memory_order_relaxed);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_test_testgame_MainActivity_setMagnified(JNIEnv* /*env*/, jobject /*thiz*/, jboolean magnified) {
+    sMagnified.store(magnified, std::memory_order_relaxed);
 }
